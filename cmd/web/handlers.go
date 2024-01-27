@@ -1,60 +1,88 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"html/template"
-	"log"
 	"net/http"
 	"strconv"
+
+	"snippetbox.adel.net/internal/models"
+	"snippetbox.adel.net/internal/validator"
+
+	"github.com/julienschmidt/httprouter"
 )
 
-func home(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-
-	files := []string{
-		"./ui/html/base.tmpl",
-		"./ui/html/pages/home.tmpl",
-		"./ui/html/partials/nav.tmpl",
-	}
-
-	ts, err := template.ParseFiles(files...)
-	if err != nil {
-		log.Print(err.Error())
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	err = ts.ExecuteTemplate(w, "base", nil)
-	if err != nil {
-		log.Print(err.Error())
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-	}
+type snippetCreateForm struct {
+	Title               string `form:"title"`
+	Content             string `form:"content"`
+	Expires             int    `form:"expires"`
+	validator.Validator `form:"-"`
 }
 
-func snippetView(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+func (app *application) home(w http.ResponseWriter, r *http.Request) {
+
+	snippets, err := app.snippets.Latest()
+	if err != nil {
+		app.serverError(w, r, err)
+		return
+	}
+
+	data := app.newTemplateData(r)
+	data.Snippets = snippets
+
+	app.render(w, r, http.StatusOK, "home.tmpl", data)
+}
+
+func (app *application) snippetView(w http.ResponseWriter, r *http.Request) {
+	params := httprouter.ParamsFromContext(r.Context())
+	id, err := strconv.Atoi(params.ByName("id"))
 	if err != nil || id < 1 {
-		http.NotFound(w, r)
+		app.notFound(w)
 		return
 	}
-
-	fmt.Fprintf(w, "Display a specific snippet with ID %d...", id)
+	snippet, err := app.snippets.Get(id)
+	if err != nil {
+		if errors.Is(err, models.ErrNoRecord) {
+			app.notFound(w)
+		} else {
+			app.serverError(w, r, err)
+		}
+		return
+	}
+	data := app.newTemplateData(r)
+	data.Snippet = snippet
+	app.render(w, r, http.StatusOK, "view.tmpl", data)
 }
 
-func snippetCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+func (app *application) snippetCreate(w http.ResponseWriter, r *http.Request) {
+	data := app.newTemplateData(r)
+	app.render(w, r, http.StatusOK, "create.tmpl", data)
+}
 
-		w.Header().Set("Allow", http.MethodPost)
-
-		// w.WriteHeader(405)
-		// w.Write([]byte("Method not allowed"))
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed) // same functionality as the above
-
+func (app *application) snippetCreatePost(w http.ResponseWriter, r *http.Request) {
+	var form snippetCreateForm
+	err := app.decodePostForm(r, &form)
+	if err != nil {
+		app.clientError(w, http.StatusBadRequest)
+		return
+	}
+	form.CheckField(validator.NotBlank(form.Title), "title", "This field cannot be blank")
+	form.CheckField(validator.MaxChars(form.Title, 100), "title", "This field cannot be more than 100 characters long")
+	form.CheckField(validator.NotBlank(form.Content), "content", "This field cannot be blank")
+	form.CheckField(validator.PermittedValue(form.Expires, 1, 7, 365), "expires", "This field must equal 1, 7 or 365")
+	if !form.Valid() {
+		data := app.newTemplateData(r)
+		data.Form = form
+		app.render(w, r, http.StatusUnprocessableEntity, "create.tmpl", data)
+		return
+	}
+	id, err := app.snippets.Insert(form.Title, form.Content, form.Expires)
+	if err != nil {
+		app.serverError(w, r, err)
 		return
 	}
 
-	w.Write([]byte("Create a new snippet..."))
+	app.sessionManager.Put(r.Context(), "flash", "Snippet successfully created!")
+
+	http.Redirect(w, r, fmt.Sprintf("/snippet/view/%d", id), http.StatusSeeOther)
 }
